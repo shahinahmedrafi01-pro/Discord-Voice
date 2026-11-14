@@ -3,8 +3,14 @@
 A small Discord bot that plays Quran recitation in a voice channel, 24/7.
 It streams **direct MP3 files from mp3quran.net** — no YouTube, no login, no verification blocks.
 
-- Plays surah 001 → 114 in order, then loops.
-- Commands: `!quran` (join your voice channel and play), `!stop` (stop and leave).
+- Auto-joins ONE fixed voice channel and plays surah 001 → 114 in order, then loops. Restarts start again from Surah 1.
+- Commands (slash + typed versions of each):
+  - `/play <number>` or `!play 50` — anyone can request a surah; it is queued and plays after the current surah. When the request line empties, the main sequence resumes where it left off (25 → 50 requested → back to 26). Max 3 queued requests per person.
+  - `/start` or `!start` — staff only (Administrator / Manage Server). Already online → says so; disconnected → rejoins; cannot join → "maintenance".
+  - `/now` or `!now` — shows the surah playing now (number + name) and the request line.
+  - There is **no stop command** — by design, nobody can stop the recitation.
+  - A watchdog rejoins the channel by itself if the bot is ever disconnected.
+- The fixed channel is set in `bot.py` (`FIXED_VOICE_CHANNEL_ID`, or the `VOICE_CHANNEL_ID` env var).
 - Built for the DAVE voice-encryption era: uses `discord.py` + `davey` + `PyNaCl` + `ffmpeg`.
 
 ## Before running — Discord Developer Portal (owner does this)
@@ -22,7 +28,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Then in Discord: join a voice channel yourself and type `!quran` in a text channel.
+The bot joins the fixed voice channel by itself and starts playing. In Discord, try `!play 18` or `/now` in any text channel.
 
 ## Deploy on Render (free Web Service)
 

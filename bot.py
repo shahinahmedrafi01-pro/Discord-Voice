@@ -1,38 +1,64 @@
-# Quran Voice Bot — plays Quran recitation 24/7 in one Discord voice channel.
+# Quran Voice Bot — plays Quran recitation 24/7 in ONE fixed Discord voice channel.
 # Source: direct MP3 streams from mp3quran.net (NO YouTube, NO login, NO verification).
-# Plays surah 001 -> 114 in order, then loops back to 001.
 #
-# Setup:
-#   1. pip install -r requirements.txt   (also needs ffmpeg installed on the machine)
-#   2. Give the bot token ONE of these two ways (never commit it, never share it, never paste it in a chat):
-#        - environment variable:  DISCORD_TOKEN=<token>
-#        - or a file named  token.txt  next to this file (one line, nothing else; already in .gitignore)
-#   3. python bot.py
-# Commands (in any text channel the bot can read):
-#   !quran   -> bot joins YOUR voice channel and starts playing
-#   !stop    -> bot stops and leaves the voice channel
+# Behaviour:
+#   * Auto-joins the fixed voice channel on startup and plays Surah 1 -> 114 in order, looping.
+#     A restart simply starts again from Surah 1.
+#   * Anyone can request a surah: /play <number> or !play <number>. The request is QUEUED and
+#     plays right after the current surah ends. Requests line up in order. When the request
+#     line is empty, the main sequence resumes where it left off
+#     (example: 25 playing -> 50 requested -> 50 plays -> back to 26).
+#   * /start (also !start) is staff-only: already in the channel -> says it is already online;
+#     disconnected -> rejoins and plays; cannot join -> reports maintenance.
+#   * /now (also !now) shows the surah playing now + the request line.
+#   * There is deliberately NO stop command — nobody can stop the recitation.
+#   * A watchdog rejoins the channel by itself if the bot is ever disconnected.
+#
+# Setup: see README.md. Token via DISCORD_TOKEN env var or token.txt next to this file.
+# NEVER share the token with anyone, never paste it in a chat, never commit it.
 
 import os
 import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import discord
-from discord.ext import commands
+from discord import app_commands
+from discord.ext import commands, tasks
 
 # ---------- config you can change ----------
-# Reciter stream base (mp3quran.net mirror). Files are 001.mp3 ... 114.mp3 under this URL.
-# Other reciters = different base URLs on mp3quran.net; change only this line to switch.
-RECITER_BASE = "https://server8.mp3quran.net/bna/"
+RECITER_BASE = "https://server8.mp3quran.net/bna/"  # mp3quran.net mirror: 001.mp3 ... 114.mp3
 START_SURAH = 1  # 1-114
-# Fixed voice channel: when set, the bot joins ONLY this voice channel (never any other)
-# and starts playing automatically as soon as it comes online. Commands still work from
-# any text channel. Can be overridden by the VOICE_CHANNEL_ID environment variable.
 FIXED_VOICE_CHANNEL_ID = 1557702195263311971  # Rafi's chosen Quran voice channel (set 2026-11-14)
+MAX_QUEUE_PER_USER = 3  # one person can line up at most this many requested surahs
+WATCHDOG_SECONDS = 30
 # -------------------------------------------
 
 FIXED_VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", "") or FIXED_VOICE_CHANNEL_ID)
-
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
+
+SURAHS = [
+    "Al-Fatihah", "Al-Baqarah", "Aal-e-Imran", "An-Nisa", "Al-Maidah", "Al-An'am",
+    "Al-A'raf", "Al-Anfal", "At-Tawbah", "Yunus", "Hud", "Yusuf", "Ar-Ra'd",
+    "Ibrahim", "Al-Hijr", "An-Nahl", "Al-Isra", "Al-Kahf", "Maryam", "Ta-Ha",
+    "Al-Anbiya", "Al-Hajj", "Al-Mu'minun", "An-Nur", "Al-Furqan", "Ash-Shu'ara",
+    "An-Naml", "Al-Qasas", "Al-Ankabut", "Ar-Rum", "Luqman", "As-Sajdah",
+    "Al-Ahzab", "Saba", "Fatir", "Ya-Sin", "As-Saffat", "Sad", "Az-Zumar",
+    "Ghafir", "Fussilat", "Ash-Shura", "Az-Zukhruf", "Ad-Dukhan", "Al-Jathiyah",
+    "Al-Ahqaf", "Muhammad", "Al-Fath", "Al-Hujurat", "Qaf", "Adh-Dhariyat",
+    "At-Tur", "An-Najm", "Al-Qamar", "Ar-Rahman", "Al-Waqi'ah", "Al-Hadid",
+    "Al-Mujadila", "Al-Hashr", "Al-Mumtahanah", "As-Saff", "Al-Jumu'ah",
+    "Al-Munafiqun", "At-Taghabun", "At-Talaq", "At-Tahrim", "Al-Mulk",
+    "Al-Qalam", "Al-Haqqah", "Al-Ma'arij", "Nuh", "Al-Jinn", "Al-Muzzammil",
+    "Al-Muddaththir", "Al-Qiyamah", "Al-Insan", "Al-Mursalat", "An-Naba",
+    "An-Nazi'at", "Abasa", "At-Takwir", "Al-Infitar", "Al-Mutaffifin",
+    "Al-Inshiqaq", "Al-Buruj", "At-Tariq", "Al-A'la", "Al-Ghashiyah", "Al-Fajr",
+    "Al-Balad", "Ash-Shams", "Al-Layl", "Ad-Duha", "Ash-Sharh", "At-Tin",
+    "Al-Alaq", "Al-Qadr", "Al-Bayyinah", "Az-Zalzalah", "Al-Adiyat",
+    "Al-Qari'ah", "At-Takathur", "Al-Asr", "Al-Humazah", "Al-Fil", "Quraysh",
+    "Al-Ma'un", "Al-Kawthar", "Al-Kafirun", "An-Nasr", "Al-Masad", "Al-Ikhlas",
+    "Al-Falaq", "An-Nas",
+]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -43,31 +69,26 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
-state = {"playing": False, "surah": START_SURAH, "task": None}
+state = {
+    "playing": False,
+    "current": None,        # surah number playing right now
+    "resume": START_SURAH,  # next surah of the main 1->114 sequence
+    "queue": [],            # requested surahs: list of (surah:int, user_id:int)
+    "task": None,
+    "synced": False,
+}
 
 
 def surah_url(n: int) -> str:
     return f"{RECITER_BASE}{n:03d}.mp3"
 
 
-async def play_loop(vc: discord.VoiceClient):
-    """Play surahs in order, looping forever, until stopped."""
-    while state["playing"]:
-        n = state["surah"]
-        source = discord.FFmpegPCMAudio(surah_url(n), **FFMPEG_OPTIONS)
-        done = asyncio.Event()
-
-        def after(_err, ev=done):
-            bot.loop.call_soon_threadsafe(ev.set)
-
-        vc.play(source, after=after)
-        print(f"[quran-bot] now playing surah {n:03d} -> {surah_url(n)}")
-        await done.wait()
-        state["surah"] = n + 1 if n < 114 else 1
+def surah_label(n: int) -> str:
+    return f"Surah {n} — {SURAHS[n - 1]}"
 
 
 async def _fixed_channel():
-    """Return the configured fixed voice channel, or None if not set/found."""
+    """Return the configured fixed voice channel, or None if not set/found/not a voice channel."""
     if not FIXED_VOICE_CHANNEL_ID:
         return None
     ch = bot.get_channel(FIXED_VOICE_CHANNEL_ID)
@@ -79,57 +100,187 @@ async def _fixed_channel():
     return ch if isinstance(ch, discord.VoiceChannel) else None
 
 
-async def _start_in(channel):
-    """Connect to the given voice channel (if needed) and start the play loop."""
-    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
+async def _ensure_vc():
+    """Connect to the fixed voice channel (moving if needed). Returns the VoiceClient or None."""
+    ch = await _fixed_channel()
+    if ch is None:
+        return None
+    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
     if vc is None:
-        vc = await channel.connect()
-    elif vc.channel != channel:
-        await vc.move_to(channel)
-    if state["playing"]:
-        return vc
-    state["playing"] = True
-    state["surah"] = START_SURAH
-    state["task"] = asyncio.create_task(play_loop(vc))
+        vc = await ch.connect()
+    elif vc.channel != ch:
+        await vc.move_to(ch)
     return vc
+
+
+async def _play_loop():
+    state["playing"] = True
+    try:
+        while True:
+            vc = await _ensure_vc()
+            if vc is None:
+                await asyncio.sleep(10)
+                continue
+            if state["queue"]:
+                n, _uid = state["queue"].pop(0)
+            else:
+                n = state["resume"]
+                state["resume"] = n % 114 + 1
+            state["current"] = n
+            done = asyncio.Event()
+
+            def _after(_err, ev=done):
+                bot.loop.call_soon_threadsafe(ev.set)
+
+            try:
+                vc.play(discord.FFmpegPCMAudio(surah_url(n), **FFMPEG_OPTIONS), after=_after)
+            except Exception as e:
+                print(f"[quran-bot] play failed for surah {n}: {e}")
+                state["current"] = None
+                await asyncio.sleep(5)
+                continue
+            print(f"[quran-bot] now playing {surah_label(n)}")
+            await done.wait()
+            state["current"] = None
+    finally:
+        state["playing"] = False
+        state["current"] = None
+
+
+def _ensure_task():
+    t = state["task"]
+    if t is None or t.done():
+        state["task"] = asyncio.create_task(_play_loop())
+    return state["task"]
+
+
+@tasks.loop(seconds=WATCHDOG_SECONDS)
+async def _watchdog():
+    """If the bot is ever disconnected from the fixed channel, rejoin by itself."""
+    ch = await _fixed_channel()
+    if ch is None:
+        return
+    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+    if vc is None or not vc.is_connected() or vc.channel != ch:
+        print("[quran-bot] watchdog: reconnecting to the fixed channel")
+        try:
+            await _ensure_vc()
+        except Exception as e:
+            print(f"[quran-bot] watchdog reconnect failed: {e}")
+            return
+    _ensure_task()
 
 
 @bot.event
 async def on_ready():
-    print(f"[quran-bot] logged in as {bot.user} — send !quran in the server to start.")
+    print(f"[quran-bot] logged in as {bot.user}")
+    if not state["synced"]:
+        state["synced"] = True
+        try:
+            synced = await bot.tree.sync()
+            print(f"[quran-bot] synced {len(synced)} slash commands")
+        except Exception as e:
+            print(f"[quran-bot] slash sync failed: {e}")
+    if not _watchdog.is_running():
+        _watchdog.start()
+    _ensure_task()
+
+
+# ---------------- shared command logic ----------------
+
+async def _request_surah(user, n: int) -> str:
+    if not (1 <= n <= 114):
+        return "❌ সূরা নম্বর 1 থেকে 114-এর মধ্যে হতে হবে।"
+    mine = sum(1 for _s, uid in state["queue"] if uid == user.id)
+    if mine >= MAX_QUEUE_PER_USER:
+        return f"❌ তুমি ইতিমধ্যে {MAX_QUEUE_PER_USER}টা সূরা লাইনে রেখেছ। আগে সেগুলো শেষ হোক।"
+    state["queue"].append((n, user.id))
+    _ensure_task()
+    pos = len(state["queue"])
+    cur = state["current"]
+    if cur:
+        return (f"✅ **{surah_label(n)}** লাইনে যোগ হয়েছে (লাইনে {pos} নম্বর)। "
+                f"এখন চলছে **{surah_label(cur)}** — লাইন অনুযায়ী এটা বাজবে।")
+    return f"✅ **{surah_label(n)}** লাইনে যোগ হয়েছে (লাইনে {pos} নম্বর)।"
+
+
+def _is_staff(member) -> bool:
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_guild))
+
+
+async def _start(user) -> str:
+    if not _is_staff(user):
+        return "⛔ এই command শুধু server staff (Admin/Moderator) ব্যবহার করতে পারবে।"
     ch = await _fixed_channel()
-    if ch is not None and not state["playing"]:
-        print(f"[quran-bot] fixed channel mode: auto-joining '{ch.name}' ({ch.id})")
-        await _start_in(ch)
+    if ch is None:
+        return "🛠️ Bot এখন maintenance-এ আছে।"
+    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+    if vc and vc.is_connected() and vc.channel == ch and state["playing"]:
+        cur = state["current"]
+        now = f" — এখন চলছে **{surah_label(cur)}**" if cur else ""
+        return f"✅ Bot already online আছে{now}।"
+    try:
+        await _ensure_vc()
+    except Exception:
+        return "🛠️ Bot এখন maintenance-এ আছে।"
+    _ensure_task()
+    return "▶️ Bot start হয়েছে — Quran play চলছে।"
 
 
-@bot.command(name="quran")
-async def quran(ctx):
-    """Start the Quran stream — in the fixed channel if one is set, else the caller's channel."""
-    fixed = await _fixed_channel()
-    if fixed is not None:
-        await _start_in(fixed)
-        await ctx.send(f"▶️ Quran play হচ্ছে এই channel-এ: **{fixed.name}** — থামাতে !stop")
+def _now_text() -> str:
+    cur = state["current"]
+    if not state["playing"] or not cur:
+        return "🎧 এখন কিছু চলছে না।"
+    if state["queue"]:
+        line = ", ".join(f"**{surah_label(s)}**" for s, _u in state["queue"])
+    else:
+        line = "খালি"
+    return f"🎧 এখন চলছে: **{surah_label(cur)}**\nলাইনে আছে: {line}"
+
+
+# ---------------- slash commands ----------------
+
+@bot.tree.command(name="play", description="Request a surah by number — it plays after the current surah")
+@app_commands.describe(surah="Surah number (1-114)")
+async def slash_play(interaction: discord.Interaction, surah: app_commands.Range[int, 1, 114]):
+    await interaction.response.send_message(await _request_surah(interaction.user, surah))
+
+
+@bot.tree.command(name="start", description="Start the Quran bot (staff only)")
+async def slash_start(interaction: discord.Interaction):
+    await interaction.response.send_message(await _start(interaction.user))
+
+
+@bot.tree.command(name="now", description="Show what is playing now and the request line")
+async def slash_now(interaction: discord.Interaction):
+    await interaction.response.send_message(_now_text())
+
+
+# ---------------- prefix commands (same features, typed) ----------------
+
+@bot.command(name="play")
+async def prefix_play(ctx, surah: int = None):
+    if surah is None:
+        await ctx.send("ব্যবহার: `!play <surah number>` — যেমন `!play 50`")
         return
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("আগে তুমি নিজে একটা voice channel-এ join করো, তারপর !quran লেখো।")
-        return
-    await _start_in(ctx.author.voice.channel)
-    await ctx.send(f"▶️ Quran play শুরু হলো — Surah {START_SURAH:03d} থেকে, একটানা চলবে। থামাতে !stop")
+    await ctx.send(await _request_surah(ctx.author, surah))
 
 
-@bot.command(name="stop")
-async def stop(ctx):
-    state["playing"] = False
-    if state["task"]:
-        state["task"].cancel()
-        state["task"] = None
-    vc = ctx.voice_client
-    if vc:
-        if vc.is_playing():
-            vc.stop()
-        await vc.disconnect()
-    await ctx.send("⏹️ Quran play বন্ধ করা হলো।")
+@bot.command(name="start")
+async def prefix_start(ctx):
+    await ctx.send(await _start(ctx.author))
+
+
+@bot.command(name="now")
+async def prefix_now(ctx):
+    await ctx.send(_now_text())
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("❌ সূরা নম্বরটা ঠিকমতো লেখো — যেমন `!play 50`")
 
 
 # --- tiny health server: lets a free Web Service host (Render) run this bot ---
