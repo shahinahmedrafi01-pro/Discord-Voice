@@ -24,7 +24,13 @@ from discord.ext import commands
 # Other reciters = different base URLs on mp3quran.net; change only this line to switch.
 RECITER_BASE = "https://server8.mp3quran.net/bna/"
 START_SURAH = 1  # 1-114
+# Fixed voice channel: when set, the bot joins ONLY this voice channel (never any other)
+# and starts playing automatically as soon as it comes online. Commands still work from
+# any text channel. Can be overridden by the VOICE_CHANNEL_ID environment variable.
+FIXED_VOICE_CHANNEL_ID = 0  # <-- the one voice channel's ID goes here
 # -------------------------------------------
+
+FIXED_VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", "") or FIXED_VOICE_CHANNEL_ID)
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.txt")
 
@@ -60,29 +66,55 @@ async def play_loop(vc: discord.VoiceClient):
         state["surah"] = n + 1 if n < 114 else 1
 
 
-@bot.event
-async def on_ready():
-    print(f"[quran-bot] logged in as {bot.user} — send !quran in the server to start.")
+async def _fixed_channel():
+    """Return the configured fixed voice channel, or None if not set/found."""
+    if not FIXED_VOICE_CHANNEL_ID:
+        return None
+    ch = bot.get_channel(FIXED_VOICE_CHANNEL_ID)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(FIXED_VOICE_CHANNEL_ID)
+        except Exception:
+            return None
+    return ch if isinstance(ch, discord.VoiceChannel) else None
 
 
-@bot.command(name="quran")
-async def quran(ctx):
-    """Join the caller's voice channel and start the Quran stream."""
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("আগে তুমি নিজে একটা voice channel-এ join করো, তারপর !quran লেখো।")
-        return
-    channel = ctx.author.voice.channel
-    vc = ctx.voice_client
+async def _start_in(channel):
+    """Connect to the given voice channel (if needed) and start the play loop."""
+    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
     if vc is None:
         vc = await channel.connect()
     elif vc.channel != channel:
         await vc.move_to(channel)
     if state["playing"]:
-        await ctx.send("Quran already playing চলছে। থামাতে !stop লেখো।")
-        return
+        return vc
     state["playing"] = True
     state["surah"] = START_SURAH
     state["task"] = asyncio.create_task(play_loop(vc))
+    return vc
+
+
+@bot.event
+async def on_ready():
+    print(f"[quran-bot] logged in as {bot.user} — send !quran in the server to start.")
+    ch = await _fixed_channel()
+    if ch is not None and not state["playing"]:
+        print(f"[quran-bot] fixed channel mode: auto-joining '{ch.name}' ({ch.id})")
+        await _start_in(ch)
+
+
+@bot.command(name="quran")
+async def quran(ctx):
+    """Start the Quran stream — in the fixed channel if one is set, else the caller's channel."""
+    fixed = await _fixed_channel()
+    if fixed is not None:
+        await _start_in(fixed)
+        await ctx.send(f"▶️ Quran play হচ্ছে এই channel-এ: **{fixed.name}** — থামাতে !stop")
+        return
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("আগে তুমি নিজে একটা voice channel-এ join করো, তারপর !quran লেখো।")
+        return
+    await _start_in(ctx.author.voice.channel)
     await ctx.send(f"▶️ Quran play শুরু হলো — Surah {START_SURAH:03d} থেকে, একটানা চলবে। থামাতে !stop")
 
 
