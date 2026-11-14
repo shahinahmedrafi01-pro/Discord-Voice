@@ -27,7 +27,7 @@ START_SURAH = 1  # 1-114
 # Fixed voice channel: when set, the bot joins ONLY this voice channel (never any other)
 # and starts playing automatically as soon as it comes online. Commands still work from
 # any text channel. Can be overridden by the VOICE_CHANNEL_ID environment variable.
-FIXED_VOICE_CHANNEL_ID = 0  # <-- the one voice channel's ID goes here
+FIXED_VOICE_CHANNEL_ID = 1557702195263311971  # Rafi's chosen Quran voice channel (set 2026-11-14)
 # -------------------------------------------
 
 FIXED_VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", "") or FIXED_VOICE_CHANNEL_ID)
