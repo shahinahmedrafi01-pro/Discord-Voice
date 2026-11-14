@@ -14,6 +14,8 @@
 
 import os
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import discord
 from discord.ext import commands
 
@@ -98,7 +100,26 @@ async def stop(ctx):
     await ctx.send("⏹️ Quran play বন্ধ করা হলো।")
 
 
+# --- tiny health server: lets a free Web Service host (Render) run this bot ---
+# Render free web services must open a port; this answers health checks on $PORT.
+# An uptime pinger (e.g. UptimeRobot) hitting the service URL keeps it awake.
+class _Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Quran bot is running.")
+
+    def log_message(self, *args):
+        pass
+
+
+def _serve_health():
+    port = int(os.environ.get("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), _Health).serve_forever()
+
+
 def main():
+    threading.Thread(target=_serve_health, daemon=True).start()
     token = os.environ.get("DISCORD_TOKEN", "").strip()
     if not token and os.path.exists(TOKEN_FILE):
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
