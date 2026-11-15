@@ -133,7 +133,10 @@ async def _play_loop():
                 bot.loop.call_soon_threadsafe(ev.set)
 
             try:
-                vc.play(discord.FFmpegPCMAudio(surah_url(n), **FFMPEG_OPTIONS), after=_after)
+                # FFmpegOpusAudio: ffmpeg itself encodes Opus. The PCM path relies on
+                # discord.py's internal encoder, which can send silent frames
+                # (bot shows the green speaking ring but nobody hears anything).
+                vc.play(discord.FFmpegOpusAudio(surah_url(n), bitrate=96, **FFMPEG_OPTIONS), after=_after)
             except Exception as e:
                 print(f"[quran-bot] play failed for surah {n}: {e}")
                 state["current"] = None
