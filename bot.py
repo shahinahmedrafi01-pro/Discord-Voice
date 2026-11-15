@@ -113,6 +113,20 @@ async def _ensure_vc():
     return vc
 
 
+def _dave_stuck(vc) -> bool:
+    """True when the voice channel uses DAVE encryption but the encryption session
+    is not ready. Audio sent in that state is dropped by Discord: the bot shows
+    the green speaking ring, but nobody hears anything. When the channel does not
+    use DAVE at all (protocol version 0), audio is fine and this returns False."""
+    conn = getattr(vc, "_connection", None)
+    if conn is None:
+        return False
+    try:
+        return conn.dave_protocol_version != 0 and not conn.can_encrypt
+    except Exception:
+        return False
+
+
 async def _play_loop():
     state["playing"] = True
     try:
@@ -120,6 +134,21 @@ async def _play_loop():
             vc = await _ensure_vc()
             if vc is None:
                 await asyncio.sleep(10)
+                continue
+            # Wait for the voice encryption session to become ready before
+            # playing. If it never becomes ready, reconnect the voice so the
+            # handshake runs again from scratch.
+            for _ in range(20):
+                if not _dave_stuck(vc):
+                    break
+                await asyncio.sleep(1)
+            if _dave_stuck(vc):
+                print("[quran-bot] voice encryption not ready; reconnecting voice")
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
                 continue
             if state["queue"]:
                 n, _uid = state["queue"].pop(0)
@@ -143,7 +172,33 @@ async def _play_loop():
                 await asyncio.sleep(5)
                 continue
             print(f"[quran-bot] now playing {surah_label(n)}")
-            await done.wait()
+            # While the surah plays, watch the encryption session. If it gets
+            # stuck (Discord would silently drop the audio), reconnect the
+            # voice connection and restart this surah.
+            stuck_checks = 0
+            while not done.is_set():
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    pass
+                if done.is_set():
+                    break
+                if _dave_stuck(vc):
+                    stuck_checks += 1
+                    if stuck_checks >= 3:
+                        print("[quran-bot] voice encryption stuck during playback; reconnecting voice")
+                        try:
+                            vc.stop()
+                        except Exception:
+                            pass
+                        try:
+                            await vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                        state["resume"] = n  # restart this surah after reconnect
+                        break
+                else:
+                    stuck_checks = 0
             state["current"] = None
     finally:
         state["playing"] = False
@@ -193,18 +248,18 @@ async def on_ready():
 
 async def _request_surah(user, n: int) -> str:
     if not (1 <= n <= 114):
-        return "❌ সূরা নম্বর 1 থেকে 114-এর মধ্যে হতে হবে।"
+        return "Surah number must be between 1 and 114."
     mine = sum(1 for _s, uid in state["queue"] if uid == user.id)
     if mine >= MAX_QUEUE_PER_USER:
-        return f"❌ তুমি ইতিমধ্যে {MAX_QUEUE_PER_USER}টা সূরা লাইনে রেখেছ। আগে সেগুলো শেষ হোক।"
+        return f"You already have {MAX_QUEUE_PER_USER} surahs in the request line. Please wait for those to finish first."
     state["queue"].append((n, user.id))
     _ensure_task()
     pos = len(state["queue"])
     cur = state["current"]
     if cur:
-        return (f"✅ **{surah_label(n)}** লাইনে যোগ হয়েছে (লাইনে {pos} নম্বর)। "
-                f"এখন চলছে **{surah_label(cur)}** — লাইন অনুযায়ী এটা বাজবে।")
-    return f"✅ **{surah_label(n)}** লাইনে যোগ হয়েছে (লাইনে {pos} নম্বর)।"
+        return (f"**{surah_label(n)}** added to the request line (position {pos}). "
+                f"Now playing: **{surah_label(cur)}**. Your request will play in order.")
+    return f"**{surah_label(n)}** added to the request line (position {pos})."
 
 
 def _is_staff(member) -> bool:
@@ -214,32 +269,33 @@ def _is_staff(member) -> bool:
 
 async def _start(user) -> str:
     if not _is_staff(user):
-        return "⛔ এই command শুধু server staff (Admin/Moderator) ব্যবহার করতে পারবে।"
+        return "This command is for server staff only (Admin / Moderator)."
     ch = await _fixed_channel()
     if ch is None:
-        return "🛠️ Bot এখন maintenance-এ আছে।"
+        return "Bot is under maintenance."
     vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
     if vc and vc.is_connected() and vc.channel == ch and state["playing"]:
         cur = state["current"]
-        now = f" — এখন চলছে **{surah_label(cur)}**" if cur else ""
-        return f"✅ Bot already online আছে{now}।"
+        if cur:
+            return f"Bot already online. Now playing: **{surah_label(cur)}**."
+        return "Bot already online."
     try:
         await _ensure_vc()
     except Exception:
-        return "🛠️ Bot এখন maintenance-এ আছে।"
+        return "Bot is under maintenance."
     _ensure_task()
-    return "▶️ Bot start হয়েছে — Quran play চলছে।"
+    return "Bot started. Quran recitation is now playing."
 
 
 def _now_text() -> str:
     cur = state["current"]
     if not state["playing"] or not cur:
-        return "🎧 এখন কিছু চলছে না।"
+        return "Nothing is playing right now."
     if state["queue"]:
         line = ", ".join(f"**{surah_label(s)}**" for s, _u in state["queue"])
     else:
-        line = "খালি"
-    return f"🎧 এখন চলছে: **{surah_label(cur)}**\nলাইনে আছে: {line}"
+        line = "empty"
+    return f"Now playing: **{surah_label(cur)}**\nRequest line: {line}"
 
 
 # ---------------- slash commands ----------------
@@ -265,7 +321,7 @@ async def slash_now(interaction: discord.Interaction):
 @bot.command(name="play")
 async def prefix_play(ctx, surah: int = None):
     if surah is None:
-        await ctx.send("ব্যবহার: `!play <surah number>` — যেমন `!play 50`")
+        await ctx.send("Usage: `!play <surah number>` — example: `!play 50`")
         return
     await ctx.send(await _request_surah(ctx.author, surah))
 
@@ -283,7 +339,7 @@ async def prefix_now(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.BadArgument):
-        await ctx.send("❌ সূরা নম্বরটা ঠিকমতো লেখো — যেমন `!play 50`")
+        await ctx.send("Please write the surah number correctly — example: `!play 50`")
 
 
 # --- tiny health server: lets a free Web Service host (Render) run this bot ---
@@ -311,7 +367,7 @@ def main():
         with open(TOKEN_FILE, "r", encoding="utf-8") as f:
             token = f.read().strip()
     if not token:
-        raise SystemExit("Token পাওয়া যায়নি — DISCORD_TOKEN environment variable দাও, অথবা bot.py-এর পাশে token.txt ফাইলে bot token-টা বসাও।")
+        raise SystemExit("Token not found. Set the DISCORD_TOKEN environment variable, or put the bot token in a token.txt file next to bot.py.")
     bot.run(token)
 
 
