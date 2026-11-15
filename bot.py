@@ -30,6 +30,25 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+# --- startup diagnostics + explicit libopus load ---
+# discord.py's opus auto-detection can fail inside slim Docker images, which
+# silently kills PCM playback; load libopus explicitly and log the versions in
+# use so any future voice failure can be proven from the logs, not guessed.
+try:
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus("libopus.so.0")
+except Exception as _e:
+    print(f"[quran-bot] opus load failed: {_e}")
+try:
+    import importlib.metadata as _md
+
+    print(
+        f"[quran-bot] discord.py {_md.version('discord.py')}, "
+        f"davey {_md.version('davey')}, opus loaded: {discord.opus.is_loaded()}"
+    )
+except Exception:
+    pass
+
 # ---------- config you can change ----------
 RECITER_BASE = "https://server8.mp3quran.net/bna/"  # mp3quran.net mirror: 001.mp3 ... 114.mp3
 START_SURAH = 1  # 1-114
