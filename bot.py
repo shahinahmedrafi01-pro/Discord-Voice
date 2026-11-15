@@ -2,8 +2,12 @@
 # Source: direct MP3 streams from mp3quran.net (NO YouTube, NO login, NO verification).
 #
 # Behaviour:
-#   * Auto-joins the fixed voice channel on startup and plays Surah 1 -> 114 in order, looping.
-#     A restart simply starts again from Surah 1.
+#   * The bot NEVER joins by itself after a restart. A staff member joins the voice
+#     channel first and runs /start; only then does the bot join and play Surah
+#     1 -> 114 in order, looping. (Joining an empty channel leaves the bot out of
+#     Discord's voice-encryption group, and all its audio is silently dropped —
+#     a listener must be present at the first join.) After that first start, the
+#     bot auto-rejoins by itself whenever it is disconnected.
 #   * Anyone can request a surah: /play <number> or !play <number>. The request is QUEUED and
 #     plays right after the current surah ends. Requests line up in order. When the request
 #     line is empty, the main sequence resumes where it left off
@@ -76,6 +80,7 @@ state = {
     "queue": [],            # requested surahs: list of (surah:int, user_id:int)
     "task": None,
     "synced": False,
+    "started": False,  # becomes True only when a staff member runs /start
     "last_dave_reconnect": 0.0,  # last time voice was reconnected over DAVE state
 }
 
@@ -229,7 +234,10 @@ def _ensure_task():
 
 @tasks.loop(seconds=WATCHDOG_SECONDS)
 async def _watchdog():
-    """If the bot is ever disconnected from the fixed channel, rejoin by itself."""
+    """If the bot is ever disconnected from the fixed channel, rejoin by itself.
+    Does nothing until a staff member has started the bot with /start."""
+    if not state["started"]:
+        return
     ch = await _fixed_channel()
     if ch is None:
         return
@@ -277,7 +285,7 @@ async def on_ready():
             print(f"[quran-bot] slash sync failed: {e}")
     if not _watchdog.is_running():
         _watchdog.start()
-    _ensure_task()
+    # No auto-join and no play loop here: the bot waits for a staff /start.
 
 
 # ---------------- shared command logic ----------------
@@ -289,7 +297,8 @@ async def _request_surah(user, n: int) -> str:
     if mine >= MAX_QUEUE_PER_USER:
         return f"You already have {MAX_QUEUE_PER_USER} surahs in the request line. Please wait for those to finish first."
     state["queue"].append((n, user.id))
-    _ensure_task()
+    if state["started"]:
+        _ensure_task()
     pos = len(state["queue"])
     cur = state["current"]
     if cur:
@@ -309,6 +318,7 @@ async def _start(user) -> str:
     ch = await _fixed_channel()
     if ch is None:
         return "Bot is under maintenance."
+    state["started"] = True  # from now on the watchdog keeps the bot in the channel
     vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
     if vc and vc.is_connected() and vc.channel == ch and state["playing"]:
         cur = state["current"]
