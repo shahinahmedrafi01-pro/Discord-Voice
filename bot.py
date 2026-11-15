@@ -46,7 +46,7 @@ except Exception:
 # ---------- config you can change ----------
 RECITER_BASE = "https://server12.mp3quran.net/maher/"  # mp3quran.net mirror: 001.mp3 ... 114.mp3 — reciter: Maher Al Muaiqly (chosen by Rafi 2026-11-15; the earlier Banna recitation felt too slow to him)
 START_SURAH = 1  # 1-114
-FIXED_VOICE_CHANNEL_ID = 1557702195263311971  # Rafi's chosen Quran voice channel (set 2026-11-14)
+FIXED_VOICE_CHANNEL_ID = 1571574151796490312  # HavenCraft MAIN server Quran channel (moved from the test server 2026-11-16 at Rafi's order; the test channel was 1557702195263311971)
 WATCHDOG_SECONDS = 30
 # -------------------------------------------
 
