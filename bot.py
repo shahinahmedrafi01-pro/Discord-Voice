@@ -4,10 +4,11 @@
 # Behaviour:
 #   * The bot NEVER joins by itself after a restart. A staff member joins the voice
 #     channel first and runs /start; only then does the bot join and play Surah
-#     1 -> 114 in order, looping. (Joining an empty channel leaves the bot out of
-#     Discord's voice-encryption group, and all its audio is silently dropped —
-#     a listener must be present at the first join.) After that first start, the
-#     bot auto-rejoins by itself whenever it is disconnected.
+#     1 -> 114 in order, looping. (This start-first flow is by design.) After
+#     that first start, the bot auto-rejoins by itself whenever it is
+#     disconnected. The bot NEVER disconnects itself over encryption state:
+#     an earlier version did, every few minutes, and kicked itself out of the
+#     channel while people were listening (removed 2026-11-15).
 #   * Anyone can request a surah: /play <number> or !play <number>. The request is QUEUED and
 #     plays right after the current surah ends. Requests line up in order. When the request
 #     line is empty, the main sequence resumes where it left off
@@ -100,7 +101,6 @@ state = {
     "task": None,
     "synced": False,
     "started": False,  # becomes True only when a staff member runs /start
-    "last_dave_reconnect": 0.0,  # last time voice was reconnected over DAVE state
 }
 
 
@@ -150,32 +150,6 @@ def _dave_stuck(vc) -> bool:
         return conn.dave_protocol_version != 0 and not conn.can_encrypt
     except Exception:
         return False
-
-
-def _humans_present(vc) -> int:
-    """How many non-bot members are in the voice channel right now."""
-    try:
-        return sum(1 for m in vc.channel.members if not m.bot)
-    except Exception:
-        return 0
-
-
-async def _dave_reconnect(vc, reason: str):
-    """Reconnect the voice connection so the DAVE enrollment handshake runs
-    again from scratch. A bot that joins an empty channel can be left out of
-    the encryption group (it never receives its MLS welcome), after which all
-    of its audio is silently dropped. Reconnecting while a listener is present
-    lets the enrollment complete. The play loop / watchdog rejoins by itself."""
-    state["last_dave_reconnect"] = asyncio.get_running_loop().time()
-    print(f"[quran-bot] reconnecting voice ({reason})")
-    try:
-        vc.stop()
-    except Exception:
-        pass
-    try:
-        await vc.disconnect(force=True)
-    except Exception:
-        pass
 
 
 async def _play_loop():
@@ -233,11 +207,6 @@ async def _play_loop():
                 if stuck != last_stuck:
                     print(f"[quran-bot] voice encryption ready: {not stuck}")
                     last_stuck = stuck
-                if stuck and _humans_present(vc) > 0:
-                    if asyncio.get_running_loop().time() - state["last_dave_reconnect"] > 180:
-                        state["resume"] = n  # replay this surah after the reconnect
-                        await _dave_reconnect(vc, "encryption not ready while listeners are present")
-                        break
             state["current"] = None
     finally:
         state["playing"] = False
@@ -269,27 +238,6 @@ async def _watchdog():
             print(f"[quran-bot] watchdog reconnect failed: {e}")
             return
     _ensure_task()
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """A listener joining is the moment Discord can complete the bot's
-    encryption enrollment. If the bot is connected but its encryption session
-    is not ready, reconnect the voice once so the handshake runs again with
-    the listener present."""
-    if member.bot:
-        return
-    ch = await _fixed_channel()
-    if ch is None or after.channel != ch or before.channel == ch:
-        return
-    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
-    if vc is None or not vc.is_connected() or vc.channel != ch:
-        return
-    if not _dave_stuck(vc):
-        return
-    if asyncio.get_running_loop().time() - state["last_dave_reconnect"] < 90:
-        return
-    await _dave_reconnect(vc, "a listener joined while encryption was not ready")
 
 
 @bot.event
