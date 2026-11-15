@@ -2,22 +2,15 @@
 # Source: direct MP3 streams from mp3quran.net (NO YouTube, NO login, NO verification).
 #
 # Behaviour:
-#   * The bot NEVER joins by itself after a restart. A staff member joins the voice
-#     channel first and runs /start; only then does the bot join and play Surah
-#     1 -> 114 in order, looping. (This start-first flow is by design.) After
-#     that first start, the bot auto-rejoins by itself whenever it is
-#     disconnected. The bot NEVER disconnects itself over encryption state:
-#     an earlier version did, every few minutes, and kicked itself out of the
-#     channel while people were listening (removed 2026-11-15).
-#   * Anyone can request a surah: /play <number> or !play <number>. The request is QUEUED and
-#     plays right after the current surah ends. Requests line up in order. When the request
-#     line is empty, the main sequence resumes where it left off
-#     (example: 25 playing -> 50 requested -> 50 plays -> back to 26).
-#   * /start (also !start) is staff-only: already in the channel -> says it is already online;
-#     disconnected -> rejoins and plays; cannot join -> reports maintenance.
-#   * /now (also !now) shows the surah playing now + the request line.
-#   * There is deliberately NO stop command — nobody can stop the recitation.
-#   * A watchdog rejoins the channel by itself if the bot is ever disconnected.
+#   * There is exactly ONE command: /playquran (staff only). It makes the bot
+#     join the fixed channel and play the whole Quran from Surah 1 to Surah 114,
+#     then loop back to the start WITHOUT disconnecting — forever, as long as
+#     the host runs. No other commands exist: no stop, no requests, no queue.
+#   * The bot never joins by itself after a restart: a staff member runs
+#     /playquran once, and from then on a watchdog rejoins by itself whenever
+#     the bot is disconnected. The bot NEVER disconnects itself over encryption
+#     state: an earlier version did, every few minutes, and kicked itself out
+#     of the channel while people were listening (removed 2026-11-15).
 #
 # Setup: see README.md. Token via DISCORD_TOKEN env var or token.txt next to this file.
 # NEVER share the token with anyone, never paste it in a chat, never commit it.
@@ -54,7 +47,6 @@ except Exception:
 RECITER_BASE = "https://server12.mp3quran.net/maher/"  # mp3quran.net mirror: 001.mp3 ... 114.mp3 — reciter: Maher Al Muaiqly (chosen by Rafi 2026-11-15; the earlier Banna recitation felt too slow to him)
 START_SURAH = 1  # 1-114
 FIXED_VOICE_CHANNEL_ID = 1557702195263311971  # Rafi's chosen Quran voice channel (set 2026-11-14)
-MAX_QUEUE_PER_USER = 3  # one person can line up at most this many requested surahs
 WATCHDOG_SECONDS = 30
 # -------------------------------------------
 
@@ -85,8 +77,7 @@ SURAHS = [
 ]
 
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -97,7 +88,6 @@ state = {
     "playing": False,
     "current": None,        # surah number playing right now
     "resume": START_SURAH,  # next surah of the main 1->114 sequence
-    "queue": [],            # requested surahs: list of (surah:int, user_id:int)
     "task": None,
     "synced": False,
     "started": False,  # becomes True only when a staff member runs /start
@@ -171,11 +161,8 @@ async def _play_loop():
                 await asyncio.sleep(1)
             if _dave_stuck(vc):
                 print("[quran-bot] note: voice encryption not ready yet; playing anyway")
-            if state["queue"]:
-                n, _uid = state["queue"].pop(0)
-            else:
-                n = state["resume"]
-                state["resume"] = n % 114 + 1
+            n = state["resume"]
+            state["resume"] = n % 114 + 1
             state["current"] = n
             done = asyncio.Event()
 
@@ -255,31 +242,14 @@ async def on_ready():
     # No auto-join and no play loop here: the bot waits for a staff /start.
 
 
-# ---------------- shared command logic ----------------
-
-async def _request_surah(user, n: int) -> str:
-    if not (1 <= n <= 114):
-        return "Surah number must be between 1 and 114."
-    mine = sum(1 for _s, uid in state["queue"] if uid == user.id)
-    if mine >= MAX_QUEUE_PER_USER:
-        return f"You already have {MAX_QUEUE_PER_USER} surahs in the request line. Please wait for those to finish first."
-    state["queue"].append((n, user.id))
-    if state["started"]:
-        _ensure_task()
-    pos = len(state["queue"])
-    cur = state["current"]
-    if cur:
-        return (f"**{surah_label(n)}** added to the request line (position {pos}). "
-                f"Now playing: **{surah_label(cur)}**. Your request will play in order.")
-    return f"**{surah_label(n)}** added to the request line (position {pos})."
-
+# ---------------- the one command ----------------
 
 def _is_staff(member) -> bool:
     perms = getattr(member, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
-async def _start(user) -> str:
+async def _play_quran(user) -> str:
     if not _is_staff(user):
         return "This command is for server staff only (Admin / Moderator)."
     ch = await _fixed_channel()
@@ -297,62 +267,12 @@ async def _start(user) -> str:
     except Exception:
         return "Bot is under maintenance."
     _ensure_task()
-    return "Bot started. Quran recitation is now playing."
+    return "Bot started. The full Quran is now playing from the beginning."
 
 
-def _now_text() -> str:
-    cur = state["current"]
-    if not state["playing"] or not cur:
-        return "Nothing is playing right now."
-    if state["queue"]:
-        line = ", ".join(f"**{surah_label(s)}**" for s, _u in state["queue"])
-    else:
-        line = "empty"
-    return f"Now playing: **{surah_label(cur)}**\nRequest line: {line}"
-
-
-# ---------------- slash commands ----------------
-
-@bot.tree.command(name="play", description="Request a surah by number — it plays after the current surah")
-@app_commands.describe(surah="Surah number (1-114)")
-async def slash_play(interaction: discord.Interaction, surah: app_commands.Range[int, 1, 114]):
-    await interaction.response.send_message(await _request_surah(interaction.user, surah))
-
-
-@bot.tree.command(name="start", description="Start the Quran bot (staff only)")
-async def slash_start(interaction: discord.Interaction):
-    await interaction.response.send_message(await _start(interaction.user))
-
-
-@bot.tree.command(name="now", description="Show what is playing now and the request line")
-async def slash_now(interaction: discord.Interaction):
-    await interaction.response.send_message(_now_text())
-
-
-# ---------------- prefix commands (same features, typed) ----------------
-
-@bot.command(name="play")
-async def prefix_play(ctx, surah: int = None):
-    if surah is None:
-        await ctx.send("Usage: `!play <surah number>` — example: `!play 50`")
-        return
-    await ctx.send(await _request_surah(ctx.author, surah))
-
-
-@bot.command(name="start")
-async def prefix_start(ctx):
-    await ctx.send(await _start(ctx.author))
-
-
-@bot.command(name="now")
-async def prefix_now(ctx):
-    await ctx.send(_now_text())
-
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send("Please write the surah number correctly — example: `!play 50`")
+@bot.tree.command(name="playquran", description="Play the full Quran in the voice channel, start to finish, on loop (staff only)")
+async def slash_play_quran(interaction: discord.Interaction):
+    await interaction.response.send_message(await _play_quran(interaction.user))
 
 
 # --- tiny health server: lets a free Web Service host (Render) run this bot ---
