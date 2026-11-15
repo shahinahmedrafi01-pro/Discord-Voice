@@ -135,21 +135,17 @@ async def _play_loop():
             if vc is None:
                 await asyncio.sleep(10)
                 continue
-            # Wait for the voice encryption session to become ready before
-            # playing. If it never becomes ready, reconnect the voice so the
-            # handshake runs again from scratch.
-            for _ in range(20):
+            # Give the voice encryption (DAVE) session a short chance to become
+            # ready before playing, then play either way. Encryption is applied
+            # per packet, so if the session becomes ready mid-surah, the rest of
+            # the surah is audible. Never disconnect over this state: an earlier
+            # version disconnected and reconnected in a loop (2026-11-15).
+            for _ in range(15):
                 if not _dave_stuck(vc):
                     break
                 await asyncio.sleep(1)
             if _dave_stuck(vc):
-                print("[quran-bot] voice encryption not ready; reconnecting voice")
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-                await asyncio.sleep(3)
-                continue
+                print("[quran-bot] note: voice encryption not ready yet; playing anyway")
             if state["queue"]:
                 n, _uid = state["queue"].pop(0)
             else:
@@ -172,10 +168,9 @@ async def _play_loop():
                 await asyncio.sleep(5)
                 continue
             print(f"[quran-bot] now playing {surah_label(n)}")
-            # While the surah plays, watch the encryption session. If it gets
-            # stuck (Discord would silently drop the audio), reconnect the
-            # voice connection and restart this surah.
-            stuck_checks = 0
+            # While the surah plays, log any change in the voice encryption
+            # state (diagnostics only — no action is taken on it).
+            last_stuck = None
             while not done.is_set():
                 try:
                     await asyncio.wait_for(done.wait(), timeout=10)
@@ -183,22 +178,10 @@ async def _play_loop():
                     pass
                 if done.is_set():
                     break
-                if _dave_stuck(vc):
-                    stuck_checks += 1
-                    if stuck_checks >= 3:
-                        print("[quran-bot] voice encryption stuck during playback; reconnecting voice")
-                        try:
-                            vc.stop()
-                        except Exception:
-                            pass
-                        try:
-                            await vc.disconnect(force=True)
-                        except Exception:
-                            pass
-                        state["resume"] = n  # restart this surah after reconnect
-                        break
-                else:
-                    stuck_checks = 0
+                stuck = _dave_stuck(vc)
+                if stuck != last_stuck:
+                    print(f"[quran-bot] voice encryption ready: {not stuck}")
+                    last_stuck = stuck
             state["current"] = None
     finally:
         state["playing"] = False
