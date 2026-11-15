@@ -3,7 +3,7 @@
 A small Discord bot that plays Quran recitation in a voice channel, 24/7.
 It streams **direct MP3 files from mp3quran.net** — no YouTube, no login, no verification blocks.
 
-- Auto-joins ONE fixed voice channel and plays surah 001 → 114 in order, then loops. Restarts start again from Surah 1.
+- Never joins by itself after a restart. A staff member joins the ONE fixed voice channel first and runs `/start`; the bot then joins and plays surah 001 → 114 in order, then loops. (Joining an empty channel leaves the bot outside Discord's voice-encryption group and its audio is silently dropped, so a listener must be present at the first join.) After that first start, it auto-rejoins by itself whenever disconnected. Restarts wait for `/start` again and begin from Surah 1.
 - Commands (slash + typed versions of each):
   - `/play <number>` or `!play 50` — anyone can request a surah; it is queued and plays after the current surah. When the request line empties, the main sequence resumes where it left off (25 → 50 requested → back to 26). Max 3 queued requests per person.
   - `/start` or `!start` — staff only (Administrator / Manage Server). Already online → says so; disconnected → rejoins; cannot join → "maintenance".
@@ -28,7 +28,7 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-The bot joins the fixed voice channel by itself and starts playing. In Discord, try `!play 18` or `/now` in any text channel.
+The bot logs in and waits. Join the voice channel yourself, then run `/start` (staff) — the bot joins and starts playing. In Discord, try `!play 18` or `/now` in any text channel.
 
 ## Deploy on Render (free Web Service)
 
@@ -40,7 +40,7 @@ The bot includes a tiny health server, so it can run as a free **Web Service** (
 4. Create the service. Logs should show `logged in as ...`.
 5. Point an uptime pinger (e.g. UptimeRobot, 5-minute interval) at the service URL so it does not sleep.
 
-Only secret needed anywhere: `DISCORD_TOKEN`. No channel IDs — the bot joins the voice channel of whoever types `!quran`, and reads commands from any text channel it can see.
+Only secret needed anywhere: `DISCORD_TOKEN`. After each deploy/restart, join the voice channel and run `/start` once (staff) — the bot then keeps itself in the channel.
 
 ## Notes
 
