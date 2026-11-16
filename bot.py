@@ -2,15 +2,18 @@
 # Source: direct MP3 streams from mp3quran.net (NO YouTube, NO login, NO verification).
 #
 # Behaviour:
-#   * There is exactly ONE command: /playquran (staff only). It makes the bot
-#     join the fixed channel and play the whole Quran from Surah 1 to Surah 114,
-#     then loop back to the start WITHOUT disconnecting — forever, as long as
-#     the host runs. No other commands exist: no stop, no requests, no queue.
+#   * There are exactly TWO commands, both staff only:
+#       /playquran — join the fixed channel and play the whole Quran from
+#         Surah 1 to Surah 114, then loop back to the start WITHOUT
+#         disconnecting — forever, as long as the host runs.
+#       /stopplay — disconnect from the voice channel and STAY out: the
+#         watchdog will not rejoin until a staff member runs /playquran again.
 #   * The bot never joins by itself after a restart: a staff member runs
 #     /playquran once, and from then on a watchdog rejoins by itself whenever
-#     the bot is disconnected. The bot NEVER disconnects itself over encryption
-#     state: an earlier version did, every few minutes, and kicked itself out
-#     of the channel while people were listening (removed 2026-11-15).
+#     the bot is disconnected — unless /stopplay was used. The bot NEVER
+#     disconnects itself over encryption state: an earlier version did, every
+#     few minutes, and kicked itself out of the channel while people were
+#     listening (removed 2026-11-15).
 #
 # Setup: see README.md. Token via DISCORD_TOKEN env var or token.txt next to this file.
 # NEVER share the token with anyone, never paste it in a chat, never commit it.
@@ -90,7 +93,7 @@ state = {
     "resume": START_SURAH,  # next surah of the main 1->114 sequence
     "task": None,
     "synced": False,
-    "started": False,  # becomes True only when a staff member runs /start
+    "started": False,  # True while playback is wanted: set by /playquran, cleared by /stopplay
 }
 
 
@@ -210,7 +213,8 @@ def _ensure_task():
 @tasks.loop(seconds=WATCHDOG_SECONDS)
 async def _watchdog():
     """If the bot is ever disconnected from the fixed channel, rejoin by itself.
-    Does nothing until a staff member has started the bot with /start."""
+    Does nothing until a staff member has started the bot with /playquran, and
+    stays off after /stopplay until /playquran is used again."""
     if not state["started"]:
         return
     ch = await _fixed_channel()
@@ -239,10 +243,10 @@ async def on_ready():
             print(f"[quran-bot] slash sync failed: {e}")
     if not _watchdog.is_running():
         _watchdog.start()
-    # No auto-join and no play loop here: the bot waits for a staff /start.
+    # No auto-join and no play loop here: the bot waits for a staff /playquran.
 
 
-# ---------------- the one command ----------------
+# ---------------- the two commands ----------------
 
 def _is_staff(member) -> bool:
     perms = getattr(member, "guild_permissions", None)
@@ -273,6 +277,44 @@ async def _play_quran(user) -> str:
 @bot.tree.command(name="playquran", description="Play the full Quran in the voice channel, start to finish, on loop (staff only)")
 async def slash_play_quran(interaction: discord.Interaction):
     await interaction.response.send_message(await _play_quran(interaction.user))
+
+
+async def _stop_quran(user) -> str:
+    if not _is_staff(user):
+        return "This command is for server staff only (Admin / Moderator)."
+    ch = await _fixed_channel()
+    if ch is None:
+        return "Bot is under maintenance."
+    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+    if not state["started"] and vc is None:
+        return "Bot is already stopped."
+    # Clear "started" FIRST so the watchdog cannot rejoin during teardown,
+    # then stop the play loop so it cannot reconnect on its own either.
+    state["started"] = False
+    t = state["task"]
+    state["task"] = None
+    if t is not None and not t.done():
+        t.cancel()
+    state["playing"] = False
+    state["current"] = None
+    state["resume"] = START_SURAH  # the next /playquran starts from Surah 1 again
+    if vc is not None:
+        try:
+            if vc.is_playing():
+                vc.stop()
+        except Exception:
+            pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception as e:
+            print(f"[quran-bot] stopplay disconnect failed: {e}")
+    print("[quran-bot] stopped by staff (/stopplay); staying out until /playquran")
+    return "Bot stopped. It will stay out of the voice channel until /playquran is used again."
+
+
+@bot.tree.command(name="stopplay", description="Stop the Quran and leave the voice channel until /playquran is used again (staff only)")
+async def slash_stop_quran(interaction: discord.Interaction):
+    await interaction.response.send_message(await _stop_quran(interaction.user))
 
 
 # --- tiny health server: lets a free Web Service host (Render) run this bot ---
