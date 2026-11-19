@@ -1,4 +1,5 @@
 # Quran Voice Bot — plays Quran recitation 24/7 in ONE fixed Discord voice channel.
+# METHOD 1 included (pause-when-empty + 32 kbps), pushed 2026-11-20 on Rafi's word.
 # Source: direct MP3 streams from mp3quran.net (NO YouTube, NO login, NO verification).
 #
 # Behaviour:
@@ -52,6 +53,13 @@ RECITER_BASE = "https://server12.mp3quran.net/maher/"  # mp3quran.net mirror: 00
 START_SURAH = 1  # 1-114
 FIXED_VOICE_CHANNEL_ID = 1571574151796490312  # HavenCraft MAIN server Quran channel (moved from the test server 2026-11-16 at Rafi's order; the test channel was 1557702195263311971)
 WATCHDOG_SECONDS = 30
+# --- Method 1: free-bandwidth saver (added 2026-11-19, pushed 2026-11-20) ---
+# Rafi's target: stay within Render's free 5 GB/month until ~10-12 Dec. Two levers:
+#   (a) encode at 32 kbps instead of 96 — Quran is voice-only, 32 stays clear;
+#   (b) pause when nobody is listening, resume when someone joins.
+# Render free 5 GB resets 1 Dec, so Dec gets a fresh 5 GB on top of this.
+BITRATE_KBPS = 32
+EMPTY_PAUSE_AFTER_SECONDS = 300  # 5 min grace: brief disconnects don't flap pause
 # -------------------------------------------
 
 FIXED_VOICE_CHANNEL_ID = int(os.environ.get("VOICE_CHANNEL_ID", "") or FIXED_VOICE_CHANNEL_ID)
@@ -81,6 +89,7 @@ SURAHS = [
 ]
 
 intents = discord.Intents.default()
+intents.voice_states = True  # Method 1: see who is in the voice channel
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 FFMPEG_OPTIONS = {
@@ -95,6 +104,8 @@ state = {
     "task": None,
     "synced": False,
     "started": False,  # True while playback is wanted: set by /playquran, cleared by /stopplay
+    "paused": False,   # Method 1: True while paused because the channel is empty
+    "empty_since": None,  # Method 1: monotonic time the channel first went empty
 }
 
 
@@ -193,7 +204,7 @@ async def _play_loop():
                 # FFmpegOpusAudio: ffmpeg itself encodes Opus. The PCM path relies on
                 # discord.py's internal encoder, which can send silent frames
                 # (bot shows the green speaking ring but nobody hears anything).
-                vc.play(discord.FFmpegOpusAudio(surah_url(n), bitrate=96, **FFMPEG_OPTIONS), after=_after)
+                vc.play(discord.FFmpegOpusAudio(surah_url(n), bitrate=BITRATE_KBPS, **FFMPEG_OPTIONS), after=_after)
             except Exception as e:
                 print(f"[quran-bot] play failed for surah {n}: {e}")
                 state["current"] = None
@@ -222,7 +233,7 @@ async def _play_loop():
                 # callback, leaving the bot connected but silent forever.
                 # If the player reports "not playing" for over a minute,
                 # advance to the next surah instead of sitting silent.
-                if vc.is_playing():
+                if state["paused"] or vc.is_playing():
                     stalled_since = None
                 elif stalled_since is None:
                     stalled_since = time.monotonic()
@@ -248,6 +259,48 @@ def _ensure_task():
     if t is None or t.done():
         state["task"] = asyncio.create_task(_play_loop())
     return state["task"]
+
+
+def _human_listeners(ch) -> int:
+    """Non-bot members currently in the voice channel."""
+    if ch is None:
+        return 0
+    return sum(1 for m in ch.members if not getattr(m, "bot", False))
+
+
+@tasks.loop(seconds=30)
+async def _empty_watch():
+    """Method 1: pause when nobody is listening, resume when someone joins.
+    Runs every 30 s; the 5-min grace avoids flapping on brief disconnects.
+    Pausing stops Opus packets (the bandwidth), while the bot stays in the
+    channel and the surah position is kept (ffmpeg back-pressures)."""
+    if not state["started"]:
+        return
+    ch = await _fixed_channel()
+    if ch is None:
+        return
+    vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+    if vc is None or not vc.is_connected():
+        return
+    now = time.monotonic()
+    if _human_listeners(ch) == 0:
+        if state["empty_since"] is None:
+            state["empty_since"] = now
+        elif now - state["empty_since"] >= EMPTY_PAUSE_AFTER_SECONDS and not state["paused"]:
+            if vc.is_playing():
+                vc.pause()
+                state["paused"] = True
+                print("[quran-bot] channel empty 5 min — paused to save bandwidth")
+    else:
+        state["empty_since"] = None
+        if state["paused"]:
+            try:
+                vc.resume()
+            except Exception as e:
+                print(f"[quran-bot] resume failed: {e}")
+            else:
+                state["paused"] = False
+                print("[quran-bot] listener joined — resumed playback")
 
 
 @tasks.loop(seconds=WATCHDOG_SECONDS)
@@ -283,6 +336,8 @@ async def on_ready():
             print(f"[quran-bot] slash sync failed: {e}")
     if not _watchdog.is_running():
         _watchdog.start()
+    if not _empty_watch.is_running():
+        _empty_watch.start()
     # No auto-join and no play loop here: the bot waits for a staff /playquran.
 
 
@@ -336,6 +391,8 @@ async def _stop_quran(user) -> str:
     if t is not None and not t.done():
         t.cancel()
     state["playing"] = False
+    state["paused"] = False
+    state["empty_since"] = None
     state["current"] = None
     state["resume"] = START_SURAH  # the next /playquran starts from Surah 1 again
     if vc is not None:
