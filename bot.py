@@ -21,6 +21,7 @@
 import os
 import asyncio
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
@@ -124,6 +125,18 @@ async def _ensure_vc():
     if ch is None:
         return None
     vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+    if vc is not None and not vc.is_connected():
+        # A voice client that silently lost its connection stays registered,
+        # and every play() on it fails with "Not connected to voice". The old
+        # code returned that dead client forever, so playback stalled for
+        # good until a human restarted it (this is what stopped the bot
+        # after its first full ~22h cycle, reported 2026-11-19). Drop the
+        # dead client and connect fresh instead.
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        vc = None
     if vc is None:
         vc = await ch.connect()
     elif vc.channel != ch:
@@ -167,9 +180,13 @@ async def _play_loop():
             n = state["resume"]
             state["resume"] = n % 114 + 1
             state["current"] = n
+            if n == START_SURAH:
+                print("[quran-bot] starting the Quran from Surah 1 (new cycle)")
             done = asyncio.Event()
 
-            def _after(_err, ev=done):
+            def _after(_err, ev=done, sn=n):
+                if _err is not None:
+                    print(f"[quran-bot] playback error on surah {sn}: {_err}")
                 bot.loop.call_soon_threadsafe(ev.set)
 
             try:
@@ -180,18 +197,41 @@ async def _play_loop():
             except Exception as e:
                 print(f"[quran-bot] play failed for surah {n}: {e}")
                 state["current"] = None
+                if not vc.is_connected():
+                    # Dead voice client: remove it so the next loop pass
+                    # reconnects fresh instead of failing on it forever.
+                    try:
+                        await vc.disconnect(force=True)
+                    except Exception:
+                        pass
                 await asyncio.sleep(5)
                 continue
             print(f"[quran-bot] now playing {surah_label(n)}")
             # While the surah plays, log any change in the voice encryption
             # state (diagnostics only — no action is taken on it).
             last_stuck = None
+            stalled_since = None
             while not done.is_set():
                 try:
                     await asyncio.wait_for(done.wait(), timeout=10)
                 except asyncio.TimeoutError:
                     pass
                 if done.is_set():
+                    break
+                # Stall guard: a dropped stream can swallow the after
+                # callback, leaving the bot connected but silent forever.
+                # If the player reports "not playing" for over a minute,
+                # advance to the next surah instead of sitting silent.
+                if vc.is_playing():
+                    stalled_since = None
+                elif stalled_since is None:
+                    stalled_since = time.monotonic()
+                elif time.monotonic() - stalled_since > 60:
+                    print(f"[quran-bot] playback stalled on {surah_label(n)}; moving to the next surah")
+                    try:
+                        vc.stop()
+                    except Exception:
+                        pass
                     break
                 stuck = _dave_stuck(vc)
                 if stuck != last_stuck:
